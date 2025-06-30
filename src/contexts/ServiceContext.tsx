@@ -1,6 +1,8 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { toast } from 'react-hot-toast';
+import { supabase, platformsApi, servicesApi, Platform as DBPlatform, Service as DBService } from '../lib/supabase';
 
+// Legacy interface'leri koruyoruz (geriye dönük uyumluluk için)
 export interface ServicePackage {
   id: string;
   name: string;
@@ -33,351 +35,203 @@ export interface Platform {
 interface ServiceContextType {
   services: ServicePackage[];
   platforms: Platform[];
-  addService: (service: Omit<ServicePackage, 'id' | 'createdAt' | 'updatedAt'>) => void;
-  updateService: (id: string, updates: Partial<ServicePackage>) => void;
-  deleteService: (id: string) => void;
+  loading: boolean;
+  addService: (service: Omit<ServicePackage, 'id' | 'createdAt' | 'updatedAt'>) => Promise<void>;
+  updateService: (id: string, updates: Partial<ServicePackage>) => Promise<void>;
+  deleteService: (id: string) => Promise<void>;
   getServicesByPlatform: (platform: string) => ServicePackage[];
-  addPlatform: (platform: Omit<Platform, 'id'>) => void;
-  updatePlatform: (id: string, updates: Partial<Platform>) => void;
-  deletePlatform: (id: string) => void;
-  syncData: () => void;
-  forceRefresh: () => void;
+  addPlatform: (platform: Omit<Platform, 'id'>) => Promise<void>;
+  updatePlatform: (id: string, updates: Partial<Platform>) => Promise<void>;
+  deletePlatform: (id: string) => Promise<void>;
+  syncData: () => Promise<void>;
+  forceRefresh: () => Promise<void>;
 }
 
 const ServiceContext = createContext<ServiceContextType | undefined>(undefined);
 
-// ULTRA GÜÇLÜ CROSS-DEVICE SYNC SİSTEMİ
-const STORAGE_KEYS = {
-  services: 'garantitakipcim_services_v11',
-  platforms: 'garantitakipcim_platforms_v11',
-  lastUpdate: 'garantitakipcim_lastupdate_v11',
-  version: 'garantitakipcim_version_v11',
-  syncTrigger: 'garantitakipcim_sync_trigger_v11'
-};
+// Database verilerini legacy format'a çevir
+const convertDBPlatformToLegacy = (dbPlatform: DBPlatform): Platform => ({
+  id: dbPlatform.id,
+  name: dbPlatform.name,
+  icon: dbPlatform.icon,
+  description: dbPlatform.description,
+  color: dbPlatform.color,
+  isActive: dbPlatform.is_active,
+  order: dbPlatform.order_index,
+  image: dbPlatform.image
+});
 
-// BROADCAST CHANNEL - Cross-tab communication
-let broadcastChannel: BroadcastChannel | null = null;
-if (typeof BroadcastChannel !== 'undefined') {
-  broadcastChannel = new BroadcastChannel('garantitakipcim_sync');
-}
+const convertDBServiceToLegacy = (dbService: DBService): ServicePackage => ({
+  id: dbService.id,
+  name: dbService.name,
+  description: dbService.description,
+  category: dbService.category,
+  platform: dbService.platform?.name || '',
+  prices: dbService.prices,
+  features: dbService.features,
+  deliveryTime: dbService.delivery_time,
+  quality: dbService.quality,
+  isActive: dbService.is_active,
+  createdAt: dbService.created_at,
+  updatedAt: dbService.updated_at
+});
 
-// WEBSOCKET SIMULATION - Server-Sent Events alternative
-class SyncManager {
-  private static instance: SyncManager;
-  private listeners: Set<() => void> = new Set();
-  private lastSyncTime = 0;
-  private syncInterval: NodeJS.Timeout | null = null;
+// Legacy format'ı database format'ına çevir
+const convertLegacyPlatformToDB = (platform: Omit<Platform, 'id'>): Omit<DBPlatform, 'id' | 'created_at' | 'updated_at'> => ({
+  name: platform.name,
+  icon: platform.icon,
+  description: platform.description,
+  color: platform.color,
+  is_active: platform.isActive,
+  order_index: platform.order,
+  image: platform.image
+});
 
-  static getInstance(): SyncManager {
-    if (!SyncManager.instance) {
-      SyncManager.instance = new SyncManager();
-    }
-    return SyncManager.instance;
-  }
-
-  addListener(callback: () => void) {
-    this.listeners.add(callback);
-    this.startSyncInterval();
-  }
-
-  removeListener(callback: () => void) {
-    this.listeners.delete(callback);
-    if (this.listeners.size === 0) {
-      this.stopSyncInterval();
-    }
-  }
-
-  private startSyncInterval() {
-    if (this.syncInterval) return;
-    
-    // Her 100ms kontrol et - Ultra hızlı sync
-    this.syncInterval = setInterval(() => {
-      this.checkForUpdates();
-    }, 100);
-  }
-
-  private stopSyncInterval() {
-    if (this.syncInterval) {
-      clearInterval(this.syncInterval);
-      this.syncInterval = null;
-    }
-  }
-
-  private checkForUpdates() {
-    const currentSyncTime = parseInt(localStorage.getItem(STORAGE_KEYS.lastUpdate) || '0');
-    
-    if (currentSyncTime > this.lastSyncTime) {
-      this.lastSyncTime = currentSyncTime;
-      this.notifyListeners();
-    }
-  }
-
-  private notifyListeners() {
-    this.listeners.forEach(callback => {
-      try {
-        callback();
-      } catch (error) {
-        console.error('Sync listener error:', error);
-      }
-    });
-  }
-
-  triggerSync() {
-    const timestamp = Date.now();
-    localStorage.setItem(STORAGE_KEYS.lastUpdate, timestamp.toString());
-    localStorage.setItem(STORAGE_KEYS.syncTrigger, `${timestamp}_${Math.random()}`);
-    
-    // Broadcast to other tabs/windows
-    if (broadcastChannel) {
-      broadcastChannel.postMessage({
-        type: 'SYNC_UPDATE',
-        timestamp,
-        source: 'admin_panel'
-      });
-    }
-
-    // Trigger storage event manually
-    window.dispatchEvent(new StorageEvent('storage', {
-      key: STORAGE_KEYS.lastUpdate,
-      newValue: timestamp.toString(),
-      oldValue: this.lastSyncTime.toString()
-    }));
-
-    this.notifyListeners();
-  }
-}
-
-const syncManager = SyncManager.getInstance();
+const convertLegacyServiceToDB = (service: Omit<ServicePackage, 'id' | 'createdAt' | 'updatedAt'>, platformId: string): Omit<DBService, 'id' | 'created_at' | 'updated_at' | 'platform'> => ({
+  name: service.name,
+  description: service.description,
+  category: service.category,
+  platform_id: platformId,
+  prices: service.prices,
+  features: service.features,
+  delivery_time: service.deliveryTime,
+  quality: service.quality,
+  is_active: service.isActive
+});
 
 export const ServiceProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [services, setServices] = useState<ServicePackage[]>(() => {
-    try {
-      const stored = localStorage.getItem(STORAGE_KEYS.services);
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        console.log('🚀 Services loaded:', parsed.length);
-        return parsed;
-      }
-      const defaultData = getDefaultServices();
-      console.log('🚀 Using default services:', defaultData.length);
-      return defaultData;
-    } catch (error) {
-      console.error('❌ Services load error:', error);
-      return getDefaultServices();
-    }
-  });
+  const [services, setServices] = useState<ServicePackage[]>([]);
+  const [platforms, setPlatforms] = useState<Platform[]>([]);
+  const [loading, setLoading] = useState(true);
 
-  const [platforms, setPlatforms] = useState<Platform[]>(() => {
+  // Verileri Supabase'den yükle
+  const loadData = async () => {
     try {
-      const stored = localStorage.getItem(STORAGE_KEYS.platforms);
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        console.log('🚀 Platforms loaded:', parsed.length);
-        return parsed;
-      }
-      const defaultData = getDefaultPlatforms();
-      console.log('🚀 Using default platforms:', defaultData.length);
-      return defaultData;
-    } catch (error) {
-      console.error('❌ Platforms load error:', error);
-      return getDefaultPlatforms();
-    }
-  });
+      setLoading(true);
+      console.log('🔄 Loading data from Supabase...');
 
-  const [refreshTrigger, setRefreshTrigger] = useState(0);
+      // Platformları ve hizmetleri paralel olarak yükle
+      const [dbPlatforms, dbServices] = await Promise.all([
+        platformsApi.getActive(),
+        servicesApi.getActive()
+      ]);
 
-  // ULTRA GÜÇLÜ KAYDETME FONKSİYONU
-  const saveToStorage = (newServices?: ServicePackage[], newPlatforms?: Platform[]) => {
-    try {
-      const timestamp = Date.now();
-      const updateId = `${timestamp}_${Math.random().toString(36).substr(2, 9)}`;
-      
-      console.log('🚀 ULTRA: Starting IMMEDIATE save operation...', updateId);
-      
-      if (newServices) {
-        const serviceData = JSON.stringify(newServices);
-        localStorage.setItem(STORAGE_KEYS.services, serviceData);
-        sessionStorage.setItem(STORAGE_KEYS.services, serviceData);
-        setServices([...newServices]);
-        console.log('✅ ULTRA: Services saved IMMEDIATELY:', newServices.length);
-      }
-      
-      if (newPlatforms) {
-        const platformData = JSON.stringify(newPlatforms);
-        localStorage.setItem(STORAGE_KEYS.platforms, platformData);
-        sessionStorage.setItem(STORAGE_KEYS.platforms, platformData);
-        setPlatforms([...newPlatforms]);
-        console.log('✅ ULTRA: Platforms saved IMMEDIATELY:', newPlatforms.length);
-      }
-      
-      // TIMESTAMP KAYDET
-      localStorage.setItem(STORAGE_KEYS.lastUpdate, timestamp.toString());
-      localStorage.setItem(STORAGE_KEYS.version, '11.0');
-      
-      setRefreshTrigger(prev => prev + 1);
-      
-      // ULTRA GÜÇLÜ SYNC TRİGGER
-      syncManager.triggerSync();
-      
-      console.log('🚀 ULTRA: Save operation completed SUCCESSFULLY!', updateId);
-      
+      // Legacy format'a çevir
+      const legacyPlatforms = dbPlatforms.map(convertDBPlatformToLegacy);
+      const legacyServices = dbServices.map(convertDBServiceToLegacy);
+
+      setPlatforms(legacyPlatforms);
+      setServices(legacyServices);
+
+      console.log('✅ Data loaded successfully:', {
+        platforms: legacyPlatforms.length,
+        services: legacyServices.length
+      });
+
     } catch (error) {
-      console.error('❌ ULTRA: Storage save error:', error);
-      toast.error('Veri kaydetme hatası!');
+      console.error('❌ Error loading data:', error);
+      toast.error('Veriler yüklenirken hata oluştu');
+      
+      // Fallback: varsayılan verileri kullan
+      const fallbackData = getFallbackData();
+      setPlatforms(fallbackData.platforms);
+      setServices(fallbackData.services);
+    } finally {
+      setLoading(false);
     }
   };
 
-  // ULTRA GÜÇLÜ YÜKLEME FONKSİYONU
-  const loadFromStorage = () => {
+  // Real-time subscription setup
+  useEffect(() => {
+    // İlk veri yükleme
+    loadData();
+
+    // Real-time subscriptions
+    const platformsSubscription = supabase
+      .channel('platforms_changes')
+      .on('postgres_changes', 
+        { event: '*', schema: 'public', table: 'platforms' },
+        (payload) => {
+          console.log('🔄 Platform change detected:', payload);
+          loadData();
+        }
+      )
+      .subscribe();
+
+    const servicesSubscription = supabase
+      .channel('services_changes')
+      .on('postgres_changes',
+        { event: '*', schema: 'public', table: 'services' },
+        (payload) => {
+          console.log('🔄 Service change detected:', payload);
+          loadData();
+        }
+      )
+      .subscribe();
+
+    return () => {
+      platformsSubscription.unsubscribe();
+      servicesSubscription.unsubscribe();
+    };
+  }, []);
+
+  const addService = async (service: Omit<ServicePackage, 'id' | 'createdAt' | 'updatedAt'>) => {
     try {
-      console.log('🔄 ULTRA: Loading data from storage...');
-      
-      const servicesData = localStorage.getItem(STORAGE_KEYS.services);
-      if (servicesData) {
-        const parsedServices = JSON.parse(servicesData);
-        setServices([...parsedServices]);
-        console.log('✅ ULTRA: Services reloaded:', parsedServices.length);
+      // Platform ID'sini bul
+      const platform = platforms.find(p => p.name === service.platform);
+      if (!platform) {
+        throw new Error('Platform bulunamadı');
       }
+
+      const dbService = convertLegacyServiceToDB(service, platform.id);
+      await servicesApi.create(dbService);
       
-      const platformsData = localStorage.getItem(STORAGE_KEYS.platforms);
-      if (platformsData) {
-        const parsedPlatforms = JSON.parse(platformsData);
-        setPlatforms([...parsedPlatforms]);
-        console.log('✅ ULTRA: Platforms reloaded:', parsedPlatforms.length);
-      }
-      
-      setRefreshTrigger(prev => prev + 1);
-      console.log('🔄 ULTRA: Data loading completed!');
-      
+      toast.success('Yeni hizmet eklendi!');
+      // Real-time subscription otomatik olarak güncelleyecek
     } catch (error) {
-      console.error('❌ ULTRA: Storage load error:', error);
+      console.error('Service add error:', error);
+      toast.error('Hizmet eklenirken hata oluştu');
     }
   };
 
-  // SYNC MANAGER SETUP
-  useEffect(() => {
-    const syncCallback = () => {
-      console.log('📱 ULTRA: Sync triggered, reloading data...');
-      loadFromStorage();
-    };
+  const updateService = async (id: string, updates: Partial<ServicePackage>) => {
+    try {
+      // Legacy updates'i DB format'ına çevir
+      const dbUpdates: any = {};
+      
+      if (updates.name !== undefined) dbUpdates.name = updates.name;
+      if (updates.description !== undefined) dbUpdates.description = updates.description;
+      if (updates.category !== undefined) dbUpdates.category = updates.category;
+      if (updates.prices !== undefined) dbUpdates.prices = updates.prices;
+      if (updates.features !== undefined) dbUpdates.features = updates.features;
+      if (updates.deliveryTime !== undefined) dbUpdates.delivery_time = updates.deliveryTime;
+      if (updates.quality !== undefined) dbUpdates.quality = updates.quality;
+      if (updates.isActive !== undefined) dbUpdates.is_active = updates.isActive;
 
-    syncManager.addListener(syncCallback);
-
-    return () => {
-      syncManager.removeListener(syncCallback);
-    };
-  }, []);
-
-  // BROADCAST CHANNEL LISTENER
-  useEffect(() => {
-    if (!broadcastChannel) return;
-
-    const handleBroadcast = (event: MessageEvent) => {
-      if (event.data.type === 'SYNC_UPDATE') {
-        console.log('📡 ULTRA: Broadcast received, syncing...');
-        setTimeout(loadFromStorage, 10);
+      // Platform değişikliği varsa platform_id'yi güncelle
+      if (updates.platform) {
+        const platform = platforms.find(p => p.name === updates.platform);
+        if (platform) {
+          dbUpdates.platform_id = platform.id;
+        }
       }
-    };
 
-    broadcastChannel.addEventListener('message', handleBroadcast);
-
-    return () => {
-      if (broadcastChannel) {
-        broadcastChannel.removeEventListener('message', handleBroadcast);
-      }
-    };
-  }, []);
-
-  // STORAGE EVENT LISTENER
-  useEffect(() => {
-    const handleStorageChange = (e: StorageEvent) => {
-      if (e.key === STORAGE_KEYS.lastUpdate || e.key === STORAGE_KEYS.syncTrigger) {
-        console.log('📱 ULTRA: Storage change detected, reloading...');
-        setTimeout(loadFromStorage, 10);
-      }
-    };
-
-    window.addEventListener('storage', handleStorageChange);
-
-    return () => {
-      window.removeEventListener('storage', handleStorageChange);
-    };
-  }, []);
-
-  // VISIBILITY CHANGE LISTENER - Mobil için önemli
-  useEffect(() => {
-    const handleVisibilityChange = () => {
-      if (!document.hidden) {
-        console.log('📱 ULTRA: Page visible, syncing...');
-        setTimeout(loadFromStorage, 50);
-      }
-    };
-
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-
-    return () => {
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-    };
-  }, []);
-
-  // FOCUS LISTENER - Mobil için önemli
-  useEffect(() => {
-    const handleFocus = () => {
-      console.log('📱 ULTRA: Window focused, syncing...');
-      setTimeout(loadFromStorage, 50);
-    };
-
-    window.addEventListener('focus', handleFocus);
-
-    return () => {
-      window.removeEventListener('focus', handleFocus);
-    };
-  }, []);
-
-  const syncData = () => {
-    console.log('📱 ULTRA: Manual sync triggered');
-    loadFromStorage();
+      await servicesApi.update(id, dbUpdates);
+      toast.success('Hizmet güncellendi!');
+    } catch (error) {
+      console.error('Service update error:', error);
+      toast.error('Hizmet güncellenirken hata oluştu');
+    }
   };
 
-  const forceRefresh = () => {
-    console.log('📱 ULTRA: Force refresh triggered');
-    loadFromStorage();
-    syncManager.triggerSync();
-  };
-
-  const addService = (service: Omit<ServicePackage, 'id' | 'createdAt' | 'updatedAt'>) => {
-    const newService: ServicePackage = {
-      ...service,
-      id: `service_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
-    
-    const updatedServices = [...services, newService];
-    console.log('📱 ULTRA: Service added:', newService.id);
-    
-    saveToStorage(updatedServices, undefined);
-    toast.success('Yeni hizmet eklendi!');
-  };
-
-  const updateService = (id: string, updates: Partial<ServicePackage>) => {
-    const updatedServices = services.map(service => 
-      service.id === id 
-        ? { ...service, ...updates, updatedAt: new Date().toISOString() }
-        : service
-    );
-    
-    console.log('📱 ULTRA: Service updated:', id);
-    saveToStorage(updatedServices, undefined);
-    toast.success('Hizmet güncellendi!');
-  };
-
-  const deleteService = (id: string) => {
-    const updatedServices = services.filter(service => service.id !== id);
-    console.log('📱 ULTRA: Service deleted:', id);
-    
-    saveToStorage(updatedServices, undefined);
-    toast.success('Hizmet silindi!');
+  const deleteService = async (id: string) => {
+    try {
+      await servicesApi.delete(id);
+      toast.success('Hizmet silindi!');
+    } catch (error) {
+      console.error('Service delete error:', error);
+      toast.error('Hizmet silinirken hata oluştu');
+    }
   };
 
   const getServicesByPlatform = (platform: string) => {
@@ -386,41 +240,61 @@ export const ServiceProvider: React.FC<{ children: React.ReactNode }> = ({ child
     );
   };
 
-  const addPlatform = (platform: Omit<Platform, 'id'>) => {
-    const newPlatform: Platform = {
-      ...platform,
-      id: `platform_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
-    };
-    
-    const updatedPlatforms = [...platforms, newPlatform];
-    console.log('📱 ULTRA: Platform added:', newPlatform.id);
-    
-    saveToStorage(undefined, updatedPlatforms);
-    toast.success('Yeni platform eklendi!');
+  const addPlatform = async (platform: Omit<Platform, 'id'>) => {
+    try {
+      const dbPlatform = convertLegacyPlatformToDB(platform);
+      await platformsApi.create(dbPlatform);
+      toast.success('Yeni platform eklendi!');
+    } catch (error) {
+      console.error('Platform add error:', error);
+      toast.error('Platform eklenirken hata oluştu');
+    }
   };
 
-  const updatePlatform = (id: string, updates: Partial<Platform>) => {
-    const updatedPlatforms = platforms.map(platform => 
-      platform.id === id ? { ...platform, ...updates } : platform
-    );
-    
-    console.log('📱 ULTRA: Platform updated:', id, updates);
-    saveToStorage(undefined, updatedPlatforms);
-    toast.success('Platform güncellendi!');
+  const updatePlatform = async (id: string, updates: Partial<Platform>) => {
+    try {
+      // Legacy updates'i DB format'ına çevir
+      const dbUpdates: any = {};
+      
+      if (updates.name !== undefined) dbUpdates.name = updates.name;
+      if (updates.icon !== undefined) dbUpdates.icon = updates.icon;
+      if (updates.description !== undefined) dbUpdates.description = updates.description;
+      if (updates.color !== undefined) dbUpdates.color = updates.color;
+      if (updates.isActive !== undefined) dbUpdates.is_active = updates.isActive;
+      if (updates.order !== undefined) dbUpdates.order_index = updates.order;
+      if (updates.image !== undefined) dbUpdates.image = updates.image;
+
+      await platformsApi.update(id, dbUpdates);
+      toast.success('Platform güncellendi!');
+    } catch (error) {
+      console.error('Platform update error:', error);
+      toast.error('Platform güncellenirken hata oluştu');
+    }
   };
 
-  const deletePlatform = (id: string) => {
-    const updatedPlatforms = platforms.filter(platform => platform.id !== id);
-    console.log('📱 ULTRA: Platform deleted:', id);
-    
-    saveToStorage(undefined, updatedPlatforms);
-    toast.success('Platform silindi!');
+  const deletePlatform = async (id: string) => {
+    try {
+      await platformsApi.delete(id);
+      toast.success('Platform silindi!');
+    } catch (error) {
+      console.error('Platform delete error:', error);
+      toast.error('Platform silinirken hata oluştu');
+    }
+  };
+
+  const syncData = async () => {
+    await loadData();
+  };
+
+  const forceRefresh = async () => {
+    await loadData();
   };
 
   return (
     <ServiceContext.Provider value={{
       services,
       platforms,
+      loading,
       addService,
       updateService,
       deleteService,
@@ -444,133 +318,9 @@ export const useServices = () => {
   return context;
 };
 
-// Default data functions
-function getDefaultServices(): ServicePackage[] {
-  return [
-    // Instagram Hizmetleri
-    {
-      id: 'instagram_followers_1',
-      name: 'Premium Türk Takipçi',
-      description: 'Gerçek Türk kullanıcılardan takipçi',
-      category: 'Takipçi',
-      platform: 'Instagram',
-      prices: [
-        { amount: 100, price: 15.00 },
-        { amount: 250, price: 35.00 },
-        { amount: 500, price: 65.00 },
-        { amount: 1000, price: 120.00 }
-      ],
-      features: ['Gerçek Türk hesaplar', 'Drop koruması', 'Hızlı teslimat'],
-      deliveryTime: '0-2 saat',
-      quality: 'Premium',
-      isActive: true,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    },
-    {
-      id: 'instagram_likes_1',
-      name: 'Instagram Beğeni',
-      description: 'Gönderilerinize kaliteli beğeni',
-      category: 'Beğeni',
-      platform: 'Instagram',
-      prices: [
-        { amount: 100, price: 5.00 },
-        { amount: 500, price: 20.00 },
-        { amount: 1000, price: 35.00 },
-        { amount: 2500, price: 80.00 }
-      ],
-      features: ['Hızlı teslimat', 'Güvenli', 'Drop koruması'],
-      deliveryTime: '0-1 saat',
-      quality: 'Yüksek',
-      isActive: true,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    },
-
-    // YouTube Hizmetleri
-    {
-      id: 'youtube_subscribers_1',
-      name: 'YouTube Abone',
-      description: 'Kanalınıza gerçek aboneler',
-      category: 'Abone',
-      platform: 'YouTube',
-      prices: [
-        { amount: 100, price: 25.00 },
-        { amount: 250, price: 55.00 },
-        { amount: 500, price: 100.00 },
-        { amount: 1000, price: 180.00 }
-      ],
-      features: ['Gerçek hesaplar', 'Drop koruması', 'Kaliteli'],
-      deliveryTime: '1-6 saat',
-      quality: 'Premium',
-      isActive: true,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    },
-    {
-      id: 'youtube_views_1',
-      name: 'YouTube İzlenme',
-      description: 'Videolarınıza kaliteli izlenme',
-      category: 'İzlenme',
-      platform: 'YouTube',
-      prices: [
-        { amount: 1000, price: 15.00 },
-        { amount: 5000, price: 65.00 },
-        { amount: 10000, price: 120.00 },
-        { amount: 25000, price: 280.00 }
-      ],
-      features: ['Hızlı teslimat', 'Güvenli', 'Organik görünüm'],
-      deliveryTime: '0-4 saat',
-      quality: 'Yüksek',
-      isActive: true,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    },
-
-    // TikTok Hizmetleri
-    {
-      id: 'tiktok_followers_1',
-      name: 'TikTok Takipçi',
-      description: 'TikTok hesabınıza kaliteli takipçi',
-      category: 'Takipçi',
-      platform: 'TikTok',
-      prices: [
-        { amount: 100, price: 12.00 },
-        { amount: 500, price: 55.00 },
-        { amount: 1000, price: 100.00 },
-        { amount: 2500, price: 230.00 }
-      ],
-      features: ['Gerçek hesaplar', 'Hızlı teslimat', 'Drop koruması'],
-      deliveryTime: '0-3 saat',
-      quality: 'Premium',
-      isActive: true,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    },
-    {
-      id: 'tiktok_likes_1',
-      name: 'TikTok Beğeni',
-      description: 'Videolarınıza hızlı beğeni',
-      category: 'Beğeni',
-      platform: 'TikTok',
-      prices: [
-        { amount: 100, price: 8.00 },
-        { amount: 500, price: 35.00 },
-        { amount: 1000, price: 65.00 },
-        { amount: 2500, price: 150.00 }
-      ],
-      features: ['Hızlı teslimat', 'Güvenli', 'Kaliteli'],
-      deliveryTime: '0-2 saat',
-      quality: 'Yüksek',
-      isActive: true,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    }
-  ];
-}
-
-function getDefaultPlatforms(): Platform[] {
-  return [
+// Fallback data (Supabase bağlantısı yoksa)
+function getFallbackData() {
+  const platforms: Platform[] = [
     {
       id: 'instagram',
       name: 'Instagram',
@@ -597,51 +347,30 @@ function getDefaultPlatforms(): Platform[] {
       color: 'from-gray-800 to-gray-900',
       isActive: true,
       order: 3
-    },
-    {
-      id: 'facebook',
-      name: 'Facebook',
-      icon: '👥',
-      description: 'Facebook sayfanızı büyütmek için etkili stratejiler',
-      color: 'from-blue-600 to-blue-800',
-      isActive: true,
-      order: 4
-    },
-    {
-      id: 'whatsapp',
-      name: 'WhatsApp',
-      icon: '💬',
-      description: 'WhatsApp gruplarınızı büyütmek için profesyonel hizmetler',
-      color: 'from-green-500 to-green-600',
-      isActive: true,
-      order: 5
-    },
-    {
-      id: 'snapchat',
-      name: 'Snapchat',
-      icon: '👻',
-      description: 'Snapchat hesabınızı güçlendirmek için etkili çözümler',
-      color: 'from-yellow-400 to-yellow-500',
-      isActive: true,
-      order: 6
-    },
-    {
-      id: 'telegram',
-      name: 'Telegram',
-      icon: '✈️',
-      description: 'Telegram kanallarınızı büyütmek için profesyonel hizmetler',
-      color: 'from-blue-400 to-blue-500',
-      isActive: true,
-      order: 7
-    },
-    {
-      id: 'twitter',
-      name: 'Twitter/X',
-      icon: '🐦',
-      description: 'Twitter hesabınızı güçlendirmek için profesyonel hizmetler',
-      color: 'from-blue-500 to-cyan-500',
-      isActive: true,
-      order: 8
     }
   ];
+
+  const services: ServicePackage[] = [
+    {
+      id: 'instagram_followers_1',
+      name: 'Premium Türk Takipçi',
+      description: 'Gerçek Türk kullanıcılardan takipçi',
+      category: 'Takipçi',
+      platform: 'Instagram',
+      prices: [
+        { amount: 100, price: 15.00 },
+        { amount: 250, price: 35.00 },
+        { amount: 500, price: 65.00 },
+        { amount: 1000, price: 120.00 }
+      ],
+      features: ['Gerçek Türk hesaplar', 'Drop koruması', 'Hızlı teslimat'],
+      deliveryTime: '0-2 saat',
+      quality: 'Premium',
+      isActive: true,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    }
+  ];
+
+  return { platforms, services };
 }
